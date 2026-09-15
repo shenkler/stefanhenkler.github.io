@@ -1,119 +1,231 @@
 #!/usr/bin/env python3
 """Generate publications/index.html from data/henkler_all.bib.
 
-No third-party dependencies. The site remains static: this script runs only at build time.
+The BibTeX file is the canonical source. Each rendered publication contains a
+native HTML <details> control that reveals the original, unmodified BibTeX
+entry for that publication. No client-side JavaScript is required.
 """
+
+from __future__ import annotations
+
+import html
+import re
 from pathlib import Path
-import html, re
 
 ROOT = Path(__file__).resolve().parents[1]
-BIB = ROOT / "data" / "henkler_all.bib"
-TEMPLATE = ROOT / "publications" / "template.html"
-OUTPUT = ROOT / "publications" / "index.html"
+BIB_PATH = ROOT / "data" / "henkler_all.bib"
+TEMPLATE_PATH = ROOT / "publications" / "template.html"
+OUTPUT_PATH = ROOT / "publications" / "index.html"
 
-def balanced(text, pos, opening="{", closing="}"):
-    assert text[pos] == opening
-    depth, i = 0, pos
-    while i < len(text):
-        c = text[i]
-        if c == opening: depth += 1
-        elif c == closing:
-            depth -= 1
-            if depth == 0: return text[pos+1:i], i+1
-        i += 1
-    raise ValueError("Unbalanced BibTeX braces")
+START = "<!-- PUBLICATIONS:START -->"
+END = "<!-- PUBLICATIONS:END -->"
 
-def split_entries(text):
-    out=[]; i=0
-    while True:
-        m=re.search(r'@(\w+)\s*\{', text[i:], re.I)
-        if not m: break
-        start=i+m.start(); typ=m.group(1); brace=i+m.end()-1
-        content,end=balanced(text,brace)
-        comma=content.find(',')
-        if comma<0: i=end; continue
-        key=content[:comma].strip(); fields=content[comma+1:]
-        out.append((typ.lower(),key,fields)); i=end
-    return out
 
-def parse_fields(s):
-    d={}; i=0; n=len(s)
-    while i<n:
-        while i<n and (s[i].isspace() or s[i]==','): i+=1
-        m=re.match(r'([A-Za-z][\w-]*)\s*=\s*',s[i:])
-        if not m: break
-        name=m.group(1).lower(); i+=m.end()
-        if i<n and s[i]=='{': value,i=balanced(s,i)
-        elif i<n and s[i]=='"':
-            i+=1; start=i; esc=False
-            while i<n:
-                if s[i]=='"' and not esc: break
-                esc=(s[i]=='\\' and not esc); i+=1
-            value=s[start:i]; i+=1
+def split_bibtex_entries(text: str) -> list[str]:
+    """Split BibTeX while preserving every entry exactly as written."""
+    entries: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        at = text.find("@", i)
+        if at < 0:
+            break
+        brace = text.find("{", at)
+        paren = text.find("(", at)
+        candidates = [p for p in (brace, paren) if p >= 0]
+        if not candidates:
+            break
+        opening = min(candidates)
+        closing = "}" if text[opening] == "{" else ")"
+        depth = 0
+        escaped = False
+        j = opening
+        while j < n:
+            ch = text[j]
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == text[opening]:
+                depth += 1
+            elif ch == closing:
+                depth -= 1
+                if depth == 0:
+                    entries.append(text[at : j + 1].strip())
+                    i = j + 1
+                    break
+            j += 1
         else:
-            start=i
-            while i<n and s[i]!=',': i+=1
-            value=s[start:i].strip()
-        d[name]=value.strip()
-    return d
+            raise ValueError(f"Unterminated BibTeX entry beginning at character {at}")
+    return entries
 
-def tex(s):
-    # conservative display conversion for common BibTeX sequences in this bibliography
-    reps={r'\&':'&', r'\%':'%', r'\_':'_', r'\{':'{', r'\}':'}',
-          r'{\"u}':'ü', r'{\"o}':'ö', r'{\"a}':'ä', r'{\"U}':'Ü', r'{\"O}':'Ö', r'{\"A}':'Ä', r'{\ss}':'ß',
-          r'\"u':'ü', r'\"o':'ö', r'\"a':'ä', r'\"U':'Ü', r'\"O':'Ö', r'\"A':'Ä'}
-    for a,b in reps.items(): s=s.replace(a,b)
-    s=re.sub(r'\{([^{}]*)\}',r'\1',s)
-    return re.sub(r'\s+',' ',s).strip()
 
-def authors(s):
-    if not s: return ''
-    parts=re.split(r'\s+and\s+',tex(s))
-    return '; '.join(parts)
+def entry_header(raw: str) -> tuple[str, str, str]:
+    m = re.match(r"@\s*([^\s{(]+)\s*[{(]\s*([^,\s]+)\s*,", raw, re.S)
+    if not m:
+        raise ValueError(f"Cannot parse BibTeX entry header: {raw[:80]!r}")
+    entry_type, key = m.group(1).lower(), m.group(2)
+    body_start = m.end()
+    body = raw[body_start:-1]
+    return entry_type, key, body
 
-def anchor(key): return re.sub(r'[^A-Za-z0-9_.:-]+','-',key)
 
-def venue(f,typ):
-    bits=[]
-    container=f.get('journal') or f.get('booktitle') or f.get('publisher') or f.get('howpublished')
-    if container: bits.append(tex(container))
-    if f.get('volume'): bits.append('vol. '+tex(f['volume']))
-    if f.get('number'): bits.append('no. '+tex(f['number']))
-    if f.get('pages'): bits.append('pp. '+tex(f['pages']).replace('--','–'))
-    if f.get('address'): bits.append(tex(f['address']))
-    return ', '.join(bits)
+def parse_fields(body: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    i = 0
+    n = len(body)
+    while i < n:
+        while i < n and (body[i].isspace() or body[i] == ","):
+            i += 1
+        m = re.match(r"([A-Za-z][A-Za-z0-9_-]*)\s*=\s*", body[i:])
+        if not m:
+            break
+        name = m.group(1).lower()
+        i += m.end()
+        if i >= n:
+            break
+        if body[i] == "{":
+            start = i + 1
+            depth = 1
+            i += 1
+            escaped = False
+            while i < n and depth:
+                ch = body[i]
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                i += 1
+            value = body[start : i - 1]
+        elif body[i] == '"':
+            i += 1
+            start = i
+            escaped = False
+            while i < n:
+                ch = body[i]
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    break
+                i += 1
+            value = body[start:i]
+            i += 1
+        else:
+            start = i
+            while i < n and body[i] not in ",\n\r":
+                i += 1
+            value = body[start:i].strip()
+        fields[name] = value.strip()
+    return fields
 
-records=[]
-for typ,key,raw in split_entries(BIB.read_text(encoding='utf-8')):
-    f=parse_fields(raw); f['_type']=typ; f['_key']=key
-    try: y=int(re.sub(r'\D','',f.get('year',''))[:4]) if f.get('year') else -1
-    except: y=-1
-    f['_year']=y; records.append(f)
-records.sort(key=lambda f:(f['_year'], tex(f.get('title','')).lower()), reverse=True)
 
-groups={}
-for f in records: groups.setdefault(f['_year'],[]).append(f)
-blocks=[]
-for y in sorted(groups,reverse=True):
-    label=str(y) if y>=0 else 'Undated'
-    blocks.append(f'<section class="year-group" aria-labelledby="year-{label}"><h2 id="year-{label}">{label}</h2>')
-    for f in groups[y]:
-        key=f['_key']; title=tex(f.get('title','Untitled')); auth=authors(f.get('author') or f.get('editor',''))
-        ven=venue(f,f['_type'])
-        links=[]
-        if f.get('doi'):
-            doi=tex(f['doi']); links.append(f'<a href="https://doi.org/{html.escape(doi,quote=True)}">DOI</a>')
-        if f.get('url'):
-            url=tex(f['url']); links.append(f'<a href="{html.escape(url,quote=True)}">Link</a>')
-        blocks.append(f'<article class="publication" id="pub-{html.escape(anchor(key))}" data-bibkey="{html.escape(key,quote=True)}">')
-        if auth: blocks.append(f'<p class="authors">{html.escape(auth)}</p>')
-        blocks.append(f'<p class="title"><cite>{html.escape(title)}</cite></p>')
-        if ven: blocks.append(f'<p class="venue">{html.escape(ven)}</p>')
-        if links: blocks.append('<p class="links">'+' '.join(links)+'</p>')
-        blocks.append('</article>')
-    blocks.append('</section>')
-body='\n'.join(blocks)
-t=TEMPLATE.read_text(encoding='utf-8')
-t=re.sub(r'<!-- PUBLICATIONS:START -->.*?<!-- PUBLICATIONS:END -->', '<!-- PUBLICATIONS:START -->\n'+body+'\n  <!-- PUBLICATIONS:END -->', t, flags=re.S)
-OUTPUT.write_text(t,encoding='utf-8')
-print(f'Generated {OUTPUT.relative_to(ROOT)} with {len(records)} entries.')
+LATEX_REPLACEMENTS = {
+    r'\\"a': "ä", r'\\"o': "ö", r'\\"u': "ü", r'\\"A': "Ä", r'\\"O': "Ö", r'\\"U': "Ü",
+    r"\\'a": "á", r"\\'e": "é", r"\\'i": "í", r"\\'o": "ó", r"\\'u": "ú",
+    r"\\ss": "ß", r"\\&": "&", r"\\%": "%", r"\\_": "_", "~": " ",
+}
+
+
+def plain(value: str) -> str:
+    s = value
+    for old, new in LATEX_REPLACEMENTS.items():
+        s = s.replace(old, new)
+    s = re.sub(r"\\[a-zA-Z]+\s*", "", s)
+    s = s.replace("{", "").replace("}", "")
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def authors(value: str) -> str:
+    people = re.split(r"\s+and\s+", plain(value))
+    rendered = []
+    for person in people:
+        person = person.strip()
+        if "," in person:
+            last, first = [p.strip() for p in person.split(",", 1)]
+            rendered.append(f"{first} {last}".strip())
+        else:
+            rendered.append(person)
+    if len(rendered) <= 2:
+        return " and ".join(rendered)
+    return ", ".join(rendered[:-1]) + ", and " + rendered[-1]
+
+
+def venue(fields: dict[str, str]) -> str:
+    for name in ("journal", "booktitle", "school", "institution", "publisher"):
+        if fields.get(name):
+            return plain(fields[name])
+    return ""
+
+
+def publication_html(raw: str) -> tuple[int, str, str]:
+    entry_type, key, body = entry_header(raw)
+    f = parse_fields(body)
+    year_text = plain(f.get("year", ""))
+    try:
+        year_sort = int(re.search(r"\d{4}", year_text).group())
+    except (AttributeError, ValueError):
+        year_sort = 0
+
+    author_text = authors(f.get("author") or f.get("editor", ""))
+    title_text = plain(f.get("title", key))
+    venue_text = venue(f)
+
+    parts = []
+    if author_text:
+        parts.append(html.escape(author_text))
+    parts.append(f'<span class="publication-title">{html.escape(title_text)}</span>')
+    if venue_text:
+        parts.append(f'<span class="publication-venue">{html.escape(venue_text)}</span>')
+    if year_text:
+        parts.append(html.escape(year_text))
+
+    links = []
+    doi = plain(f.get("doi", ""))
+    url = plain(f.get("url", ""))
+    if doi:
+        doi_url = doi if doi.startswith("http://") or doi.startswith("https://") else "https://doi.org/" + doi
+        links.append(f'<a href="{html.escape(doi_url, quote=True)}">DOI</a>')
+    if url and (not doi or url.rstrip("/") != ("https://doi.org/" + doi).rstrip("/")):
+        links.append(f'<a href="{html.escape(url, quote=True)}">Link</a>')
+
+    citation = ". ".join(parts) + "."
+    if links:
+        citation += " " + " · ".join(links)
+
+    raw_escaped = html.escape(raw)
+    block = f'''<article class="publication" id="pub-{html.escape(key, quote=True)}">
+  <p class="publication-entry">{citation}</p>
+  <details class="bibtex-entry">
+    <summary>BibTeX</summary>
+    <pre><code>{raw_escaped}</code></pre>
+  </details>
+</article>'''
+    sort_author = plain(f.get("author") or f.get("editor", "")).lower()
+    return year_sort, sort_author + "\0" + title_text.lower(), block
+
+
+def main() -> None:
+    bib_text = BIB_PATH.read_text(encoding="utf-8")
+    template = TEMPLATE_PATH.read_text(encoding="utf-8")
+    if START not in template or END not in template:
+        raise ValueError("Publication template is missing generation markers")
+
+    rendered = [publication_html(raw) for raw in split_bibtex_entries(bib_text)]
+    rendered.sort(key=lambda item: (-item[0], item[1]))
+    generated = "\n\n".join(item[2] for item in rendered)
+
+    before, rest = template.split(START, 1)
+    _, after = rest.split(END, 1)
+    output = before + START + "\n" + generated + "\n  " + END + after
+    OUTPUT_PATH.write_text(output, encoding="utf-8")
+    print(f"Generated {OUTPUT_PATH.relative_to(ROOT)} with {len(rendered)} entries.")
+
+
+if __name__ == "__main__":
+    main()
